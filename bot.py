@@ -163,6 +163,7 @@ def create_calendar_event(title, date_str, time_str, duration_minutes=60, descri
         "description": description,
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Ho_Chi_Minh"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Ho_Chi_Minh"},
+        "colorId": "3",
     }
     created = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created.get("htmlLink")
