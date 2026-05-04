@@ -76,18 +76,21 @@ def extract_tasks(transcript):
     response = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2048,
-        messages=[{"role": "user", "content": f"""Из расшифровки планёрки извлеки все задачи. Верни ТОЛЬКО JSON без лишнего текста:
+        messages=[{"role": "user", "content": f"""Из расшифровки извлеки все задачи. Верни ТОЛЬКО JSON без лишнего текста:
 {{
   "tasks": [
     {{
       "task": "описание задачи",
       "responsible": "имя или не указан",
       "deadline": "срок или не указан",
-      "priority": "высокий/средний/низкий"
+      "priority": "высокий/средний/низкий",
+      "type": "работа или личное"
     }}
   ],
   "summary": "краткое резюме 2-3 предложения"
 }}
+
+Правило для type: "работа" — если связано со школой EduCamp, учениками, сотрудниками, партнёрами, бизнесом. "личное" — здоровье, семья, дети, личные дела.
 
 Расшифровка:
 {transcript}"""}]
@@ -110,11 +113,11 @@ def save_to_sheets(tasks_data, date_str):
     gc = gspread.authorize(creds)
     sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
     if not sheet.cell(1, 1).value:
-        sheet.append_row(["Дата", "Задача", "Ответственный", "Срок", "Приоритет", "Статус"])
+        sheet.append_row(["Дата", "Тип", "Задача", "Ответственный", "Срок", "Приоритет", "Статус"])
     for task in tasks_data["tasks"]:
         sheet.append_row([
-            date_str, task["task"], task["responsible"],
-            task["deadline"], task["priority"], "Новая"
+            date_str, task.get("type", "работа"), task["task"],
+            task["responsible"], task["deadline"], task["priority"], "Новая"
         ])
 
 
@@ -199,7 +202,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             reply = f"✅ *Резюме:*\n{tasks_data['summary']}\n\n📋 *Задачи ({len(tasks_data['tasks'])} шт.):*\n"
             for i, t in enumerate(tasks_data["tasks"], 1):
-                reply += f"\n{i}. {t['task']}\n   👤 {t['responsible']} | 📅 {t['deadline']} | ⚡ {t['priority']}\n"
+                icon = "🏢" if t.get("type") == "работа" else "👤"
+            reply += f"\n{i}. {icon} {t['task']}\n   👤 {t['responsible']} | 📅 {t['deadline']} | ⚡ {t['priority']}\n"
         reply += "\n📊 Всё записано в Google Sheets!"
 
         await update.message.reply_text(reply, parse_mode="Markdown")
