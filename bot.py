@@ -230,10 +230,10 @@ def get_yesterday_tasks():
         return []
 
 
-def get_yesterday_events():
-    yesterday = datetime.now() - timedelta(days=1)
-    start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT00:00:00") + VIETNAM_TZ_OFFSET
-    end = yesterday.replace(hour=23, minute=59, second=59, microsecond=0).strftime("%Y-%m-%dT23:59:59") + VIETNAM_TZ_OFFSET
+def get_today_events():
+    today = datetime.now()
+    start = today.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT00:00:00") + VIETNAM_TZ_OFFSET
+    end = today.replace(hour=23, minute=59, second=59, microsecond=0).strftime("%Y-%m-%dT23:59:59") + VIETNAM_TZ_OFFSET
     try:
         creds = get_google_creds(["https://www.googleapis.com/auth/calendar.readonly"])
         service = build("calendar", "v3", credentials=creds)
@@ -249,8 +249,8 @@ def get_yesterday_events():
         return []
 
 
-def build_report_prompt(yesterday_display, sleep, tasks, events):
-    lines = [f"Отчёт за {yesterday_display}\n"]
+def build_report_prompt(yesterday_display, today_display, sleep, tasks, events):
+    lines = [f"Утренний брифинг. Вчера: {yesterday_display}, сегодня: {today_display}\n"]
 
     if "error" in sleep:
         lines.append(f"Сон: данные недоступны ({sleep['error']})\n")
@@ -274,25 +274,25 @@ def build_report_prompt(yesterday_display, sleep, tasks, events):
         lines.append("")
 
     if tasks:
-        lines.append(f"Задачи за {yesterday_display} ({len(tasks)} шт.):")
+        lines.append(f"Задачи записанные вчера ({yesterday_display}), {len(tasks)} шт.:")
         for t in tasks:
             icon = "🏢" if t.get("Тип") == "работа" else "👤"
             lines.append(f"  {icon} {t.get('Задача', '')} | {t.get('Статус', '')} | {t.get('Приоритет', '')}")
         lines.append("")
     else:
-        lines.append(f"Задач за {yesterday_display} не записано.\n")
+        lines.append(f"Задач за вчера ({yesterday_display}) не записано.\n")
 
     if events:
-        lines.append(f"События в календаре за {yesterday_display}:")
+        lines.append(f"Расписание на сегодня ({today_display}):")
         for e in events:
             start = e.get("start", {}).get("dateTime", e.get("start", {}).get("date", ""))
             time_str = start[11:16] if len(start) > 10 else ""
             lines.append(f"  {time_str} {e.get('summary', 'Без названия')}")
         lines.append("")
     else:
-        lines.append(f"Событий в календаре за {yesterday_display} нет.\n")
+        lines.append(f"Событий в календаре на сегодня ({today_display}) нет.\n")
 
-    lines.append("Напиши краткий утренний разбор: как спал (оцени честно), что сделал, что важно не забыть. Если что-то требует внимания — скажи прямо. Без воды.")
+    lines.append("Напиши утренний брифинг: как спал (честно), что важного в задачах вчера, что предстоит сегодня по календарю. Если что-то требует внимания — скажи прямо. Без воды.")
     return "\n".join(lines)
 
 
@@ -300,9 +300,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     yesterday = datetime.now() - timedelta(days=1)
     yesterday_iso = yesterday.strftime("%Y-%m-%d")
     yesterday_display = yesterday.strftime("%d.%m.%Y")
+    today_display = datetime.now().strftime("%d.%m.%Y")
 
     try:
-        await update.message.reply_text("📊 Собираю данные за вчера...")
+        await update.message.reply_text("📊 Собираю данные...")
 
         await update.message.reply_text("⌚ Загружаю данные Garmin...")
         sleep = get_garmin_sleep(yesterday_iso)
@@ -312,10 +313,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Garmin OK — сон {sleep['total']}")
 
         tasks = get_yesterday_tasks()
-        events = get_yesterday_events()
+        events = get_today_events()
 
-        await update.message.reply_text("🤖 Генерирую отчёт...")
-        prompt = build_report_prompt(yesterday_display, sleep, tasks, events)
+        await update.message.reply_text("🤖 Генерирую брифинг...")
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, tasks, events)
 
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -325,7 +326,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         report_text = response.content[0].text
-        await update.message.reply_text(f"📊 *Отчёт за {yesterday_display}*\n\n{report_text}", parse_mode="Markdown")
+        await update.message.reply_text(f"🌅 *Утренний брифинг {today_display}*\n\n{report_text}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
