@@ -225,8 +225,17 @@ def get_yesterday_tasks():
     try:
         creds = get_google_creds(["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
-        rows = gc.open_by_key(SPREADSHEET_ID).sheet1.get_all_records()
-        return [r for r in rows if r.get("Дата") == yesterday]
+        rows = gc.open_by_key(SPREADSHEET_ID).sheet1.get_all_values()
+        result = []
+        for row in rows:
+            if not row or row[0] != yesterday:
+                continue
+            # Поддержка обоих форматов: 6 колонок (без типа) и 7 колонок (с типом)
+            if len(row) >= 7:
+                result.append({"Тип": row[1], "Задача": row[2], "Ответственный": row[3], "Срок": row[4], "Приоритет": row[5], "Статус": row[6]})
+            elif len(row) >= 6:
+                result.append({"Тип": "", "Задача": row[1], "Ответственный": row[2], "Срок": row[3], "Приоритет": row[4], "Статус": row[5]})
+        return result
     except Exception:
         return []
 
