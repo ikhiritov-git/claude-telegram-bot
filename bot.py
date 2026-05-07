@@ -336,6 +336,11 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой chat ID: `{update.effective_chat.id}`", parse_mode="Markdown")
 
 
+async def cmd_testbrief(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🧪 Тест автобрифинга...")
+    await send_morning_brief(context)
+
+
 async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
     if not TELEGRAM_CHAT_ID:
         return
@@ -443,6 +448,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("testbrief", cmd_testbrief))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
