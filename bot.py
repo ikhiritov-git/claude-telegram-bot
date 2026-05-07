@@ -427,6 +427,21 @@ def food_summary(user_id):
     return f"{log.get('calories', 0)} ккал | {log.get('protein', 0)}г белка"
 
 
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ Создаю таблицу трекера...")
+    try:
+        sheet = get_or_create_tracker_sheet()
+        url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
+        await update.message.reply_text(
+            f"✅ Таблица готова!\n\n"
+            f"[Открыть таблицу]({url})\n\n"
+            f"Добавь в Railway переменную:\n`TRACKER_SPREADSHEET_ID={TRACKER_SPREADSHEET_ID}`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in checkin_state:
@@ -732,6 +747,7 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("testbrief", cmd_testbrief))
+    app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CallbackQueryHandler(handle_checkin_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
