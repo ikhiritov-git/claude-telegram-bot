@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import tempfile
 import anthropic
 from openai import OpenAI
@@ -7,8 +8,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta, time as dtime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from garminconnect import Garmin
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -17,9 +18,34 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 GARMIN_EMAIL = os.environ.get("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.environ.get("GARMIN_PASSWORD", "")
 TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+TRACKER_SPREADSHEET_ID = os.environ.get("TRACKER_SPREADSHEET_ID", "")
 SPREADSHEET_ID = "1OiwzcHadBvDJdn4qgf0wwueaHo7p5u_KXNfEvnbMTu0"
 CALENDAR_ID = "ikhiritov@gmail.com"
 VIETNAM_TZ_OFFSET = "+07:00"
+
+DAILY_HABITS = [
+    ("gratitude", "Благодарности"),
+    ("reading", "Чтение 10мин"),
+    ("no_news", "Без новостей"),
+    ("no_social", "Без соцсетей"),
+    ("no_flour", "Без мучного"),
+    ("no_sugar", "Без сахара"),
+    ("sport", "Спорт"),
+]
+WEEKLY_HABITS = [
+    ("planning", "Планёрка"),
+    ("mom_call", "Звонок маме"),
+    ("flowers", "Цветы Кате"),
+]
+TRACKER_HEADERS = [
+    "Дата", "Шаги", "Сон до 00:00", "Благодарности",
+    "Калории", "Белок (г)", "Чтение 10мин",
+    "Без новостей", "Без соцсетей", "Без мучного", "Без сахара",
+    "Спорт", "Вес (кг)", "Планёрка", "Звонок маме", "Цветы Кате",
+]
+
+checkin_state = {}  # {user_id: {habit_key: True/False, 'weight': float}}
+food_log = {}       # {user_id: {'date': str, 'calories': int, 'protein': int}}
 
 SYSTEM_PROMPT = """Ты личный ассистент Александра Ихиритова (Саши). У тебя есть глубокий контекст о его жизни — анализ 140+ файлов его личного дневника за 2020–2026 годы. Используй этот контекст когда отвечаешь — не нужно каждый раз его упоминать, просто знай его.
 
@@ -341,6 +367,243 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+def get_garmin_steps(date_str):
+    try:
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        client.login()
+        stats = client.get_stats(date_str)
+        return stats.get("totalSteps", "")
+    except Exception:
+        return ""
+
+
+def get_or_create_tracker_sheet():
+    global TRACKER_SPREADSHEET_ID
+    creds = get_google_creds([
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    gc = gspread.authorize(creds)
+    if TRACKER_SPREADSHEET_ID:
+        return gc.open_by_key(TRACKER_SPREADSHEET_ID).sheet1
+    sh = gc.create("Трекер привычек — Саша")
+    sh.share("ikhiritov@gmail.com", perm_type="user", role="writer")
+    TRACKER_SPREADSHEET_ID = sh.id
+    sh.sheet1.append_row(TRACKER_HEADERS)
+    return sh.sheet1
+
+
+def bool_emoji(val):
+    if val is True: return "✅"
+    if val is False: return "❌"
+    return "—"
+
+
+def build_checkin_keyboard(user_id, include_weekly=False):
+    habits = DAILY_HABITS + (WEEKLY_HABITS if include_weekly else [])
+    state = checkin_state.get(user_id, {})
+    keyboard = []
+    for key, name in habits:
+        val = state.get(key)
+        yes = "✅✓" if val is True else "✅"
+        no = "❌✓" if val is False else "❌"
+        keyboard.append([
+            InlineKeyboardButton(yes, callback_data=f"h:{key}:1"),
+            InlineKeyboardButton(name, callback_data="noop"),
+            InlineKeyboardButton(no, callback_data=f"h:{key}:0"),
+        ])
+    weight = checkin_state.get(user_id, {}).get("weight")
+    weight_text = f"⚖️ Вес: {weight} кг" if weight else "⚖️ Вес: напиши «вес 90.5»"
+    keyboard.append([InlineKeyboardButton(weight_text, callback_data="noop")])
+    keyboard.append([InlineKeyboardButton("💾 Сохранить", callback_data="h:save")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def food_summary(user_id):
+    today = datetime.now().strftime("%d.%m.%Y")
+    log = food_log.get(user_id, {})
+    if log.get("date") != today:
+        return "нет данных"
+    return f"{log.get('calories', 0)} ккал | {log.get('protein', 0)}г белка"
+
+
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in checkin_state:
+        checkin_state[user_id] = {}
+    today = datetime.now().strftime("%d.%m.%Y")
+    is_sunday = datetime.now().weekday() == 6
+    text = (
+        f"📋 *Чек-ин {today}*\n\n"
+        f"🍽 Питание: {food_summary(user_id)}\n"
+        f"_(кидай фото еды прямо в чат)_\n\n"
+        f"Отметь привычки:"
+    )
+    msg = await update.message.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=build_checkin_keyboard(user_id, include_weekly=is_sunday)
+    )
+
+
+async def handle_checkin_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "noop":
+        return
+
+    if user_id not in checkin_state:
+        checkin_state[user_id] = {}
+
+    if data == "h:save":
+        await save_checkin_to_sheet(user_id, query, context)
+        return
+
+    parts = data.split(":")
+    if len(parts) == 3:
+        _, key, val = parts
+        checkin_state[user_id][key] = (val == "1")
+
+    is_sunday = datetime.now().weekday() == 6
+    today = datetime.now().strftime("%d.%m.%Y")
+    text = (
+        f"📋 *Чек-ин {today}*\n\n"
+        f"🍽 Питание: {food_summary(user_id)}\n"
+        f"_(кидай фото еды прямо в чат)_\n\n"
+        f"Отметь привычки:"
+    )
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=build_checkin_keyboard(user_id, include_weekly=is_sunday)
+    )
+
+
+async def save_checkin_to_sheet(user_id, query, context):
+    today = datetime.now()
+    today_str = today.strftime("%d.%m.%Y")
+    yesterday_iso = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    today_iso = today.strftime("%Y-%m-%d")
+    is_sunday = today.weekday() == 6
+    state = checkin_state.get(user_id, {})
+
+    steps = get_garmin_steps(today_iso)
+
+    garmin = get_garmin_sleep(yesterday_iso)
+    sleep_ok = ""
+    if "error" not in garmin and garmin.get("bed_time"):
+        h = int(garmin["bed_time"].split(":")[0])
+        sleep_ok = "✅" if h < 24 else "❌"
+
+    log = food_log.get(user_id, {})
+    calories = log.get("calories", "") if log.get("date") == today_str else ""
+    protein = log.get("protein", "") if log.get("date") == today_str else ""
+
+    row = [
+        today_str, steps, sleep_ok,
+        bool_emoji(state.get("gratitude")),
+        calories, protein,
+        bool_emoji(state.get("reading")),
+        bool_emoji(state.get("no_news")),
+        bool_emoji(state.get("no_social")),
+        bool_emoji(state.get("no_flour")),
+        bool_emoji(state.get("no_sugar")),
+        bool_emoji(state.get("sport")),
+        state.get("weight", ""),
+        bool_emoji(state.get("planning")) if is_sunday else "",
+        bool_emoji(state.get("mom_call")) if is_sunday else "",
+        bool_emoji(state.get("flowers")) if is_sunday else "",
+    ]
+
+    try:
+        sheet = get_or_create_tracker_sheet()
+        sheet.append_row(row)
+        url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
+        summary = (
+            f"✅ *Чек-ин сохранён!*\n\n"
+            f"📊 Шаги: {steps or '—'} | Сон: {sleep_ok or '—'}\n"
+            f"🍽 {calories or 0} ккал | {protein or 0}г белка\n\n"
+            f"[Открыть таблицу]({url})"
+        )
+        await query.edit_message_text(summary, parse_mode="Markdown")
+        if TRACKER_SPREADSHEET_ID and "TRACKER_SPREADSHEET_ID" not in os.environ:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚙️ Добавь в Railway env var:\n`TRACKER_SPREADSHEET_ID={TRACKER_SPREADSHEET_ID}`",
+                parse_mode="Markdown"
+            )
+        checkin_state[user_id] = {}
+    except Exception as e:
+        await query.edit_message_text(f"❌ Ошибка сохранения: {e}")
+
+
+async def scheduled_checkin(context: ContextTypes.DEFAULT_TYPE):
+    if not TELEGRAM_CHAT_ID:
+        return
+    if TELEGRAM_CHAT_ID not in checkin_state:
+        checkin_state[TELEGRAM_CHAT_ID] = {}
+    today = datetime.now().strftime("%d.%m.%Y")
+    is_sunday = datetime.now().weekday() == 6
+    text = (
+        f"📋 *Чек-ин {today}*\n\n"
+        f"🍽 Питание: {food_summary(TELEGRAM_CHAT_ID)}\n"
+        f"_(кидай фото еды прямо в чат)_\n\n"
+        f"Отметь привычки:"
+    )
+    await context.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=build_checkin_keyboard(TELEGRAM_CHAT_ID, include_weekly=is_sunday)
+    )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text("🍽 Анализирую еду...")
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            img_data = base64.standard_b64encode(f.read()).decode("utf-8")
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
+                {"type": "text", "text": "Это фото еды. Оцени калории и белок. Верни ТОЛЬКО JSON без лишнего текста: {\"calories\": 450, \"protein\": 25, \"description\": \"краткое название блюда\"}"}
+            ]}]
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text.strip())
+        cal = data.get("calories", 0)
+        prot = data.get("protein", 0)
+        desc = data.get("description", "")
+        today = datetime.now().strftime("%d.%m.%Y")
+        if user_id not in food_log or food_log[user_id].get("date") != today:
+            food_log[user_id] = {"date": today, "calories": 0, "protein": 0}
+        food_log[user_id]["calories"] += cal
+        food_log[user_id]["protein"] += prot
+        total_cal = food_log[user_id]["calories"]
+        total_prot = food_log[user_id]["protein"]
+        await update.message.reply_text(
+            f"🍽 *{desc}*\n~{cal} ккал | ~{prot}г белка\n\n📊 За сегодня: {total_cal} ккал | {total_prot}г белка",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не смог проанализировать: {e}")
+    finally:
+        os.unlink(tmp_path)
+
+
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой chat ID: `{update.effective_chat.id}`", parse_mode="Markdown")
 
@@ -432,6 +695,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
+    if text.lower().startswith("вес "):
+        try:
+            weight = float(text.split()[1].replace(",", "."))
+            if user_id not in checkin_state:
+                checkin_state[user_id] = {}
+            checkin_state[user_id]["weight"] = weight
+            await update.message.reply_text(f"⚖️ Вес {weight} кг записан в чек-ин.")
+            return
+        except Exception:
+            pass
+
     if user_id not in chat_histories:
         chat_histories[user_id] = []
 
@@ -458,11 +732,16 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("testbrief", cmd_testbrief))
+    app.add_handler(CommandHandler("checkin", cmd_checkin))
+    app.add_handler(CallbackQueryHandler(handle_checkin_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Автобриф в 8:30 по Нячангу (UTC+7 = 01:30 UTC)
     app.job_queue.run_daily(send_morning_brief, time=dtime(hour=1, minute=30))
+    # Чек-ин в 22:00 по Нячангу (UTC+7 = 15:00 UTC)
+    app.job_queue.run_daily(scheduled_checkin, time=dtime(hour=15, minute=0))
 
     print("Бот запущен...")
     app.run_polling()
