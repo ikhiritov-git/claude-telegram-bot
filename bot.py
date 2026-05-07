@@ -6,7 +6,7 @@ from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from garminconnect import Garmin
@@ -16,6 +16,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 GARMIN_EMAIL = os.environ.get("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.environ.get("GARMIN_PASSWORD", "")
+TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 SPREADSHEET_ID = "1OiwzcHadBvDJdn4qgf0wwueaHo7p5u_KXNfEvnbMTu0"
 CALENDAR_ID = "ikhiritov@gmail.com"
 VIETNAM_TZ_OFFSET = "+07:00"
@@ -331,6 +332,43 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Твой chat ID: `{update.effective_chat.id}`", parse_mode="Markdown")
+
+
+async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
+    if not TELEGRAM_CHAT_ID:
+        return
+
+    yesterday = datetime.now() - timedelta(days=1)
+    yesterday_iso = yesterday.strftime("%Y-%m-%d")
+    yesterday_display = yesterday.strftime("%d.%m.%Y")
+    today_display = datetime.now().strftime("%d.%m.%Y")
+
+    try:
+        sleep = get_garmin_sleep(yesterday_iso)
+        tasks = get_yesterday_tasks()
+        events = get_today_events()
+
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, tasks, events)
+
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        report_text = response.content[0].text
+        await context.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"🌅 *Утренний брифинг {today_display}*\n\n{report_text}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ Ошибка автобрифинга: {e}")
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎙 Получил аудио, расшифровываю...")
 
@@ -404,8 +442,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Автобриф в 8:30 по Нячангу (UTC+7 = 01:30 UTC)
+    app.job_queue.run_daily(send_morning_brief, time=dtime(hour=1, minute=30))
+
     print("Бот запущен...")
     app.run_polling()
 
