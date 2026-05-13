@@ -661,7 +661,11 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ Ошибка автобрифинга: {e}")
 
 
+BLOCKED_USERS = {7783251668}
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id in BLOCKED_USERS:
+        return
     await update.message.reply_text("🎙 Получил аудио, расшифровываю...")
 
     audio = update.message.voice or update.message.audio
@@ -708,6 +712,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id in BLOCKED_USERS:
+        return
     text = update.message.text
 
     if text.lower().startswith("вес "):
