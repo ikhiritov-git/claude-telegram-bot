@@ -781,8 +781,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📝 {transcript[:300]}{'...' if len(transcript) > 300 else ''}")
 
         await update.message.reply_text("🤖 Анализирую...")
-        fwd = update.message.forward_date
-        date_str = (fwd + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd else None
+        fwd_origin = update.message.forward_origin
+        date_str = (fwd_origin.date + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd_origin else None
         await _save_tasks_and_calendar(transcript, update.message, date_str=date_str)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -812,8 +812,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if intent in ("tasks", "calendar"):
         await update.message.reply_text("🤖 Анализирую как задачи...")
-        fwd = update.message.forward_date
-        date_str = (fwd + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd else None
+        fwd_origin = update.message.forward_origin
+        date_str = (fwd_origin.date + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd_origin else None
         await _save_tasks_and_calendar(text, update.message, date_str=date_str)
         return
 
