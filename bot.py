@@ -26,6 +26,7 @@ VIETNAM_TZ_OFFSET = "+07:00"
 DAILY_HABITS = [
     ("gratitude", "Благодарности"),
     ("reading", "Чтение 10мин"),
+    ("finance", "Учет финансов"),
     ("no_news", "Без новостей"),
     ("no_social", "Без соцсетей"),
     ("no_flour", "Без мучного"),
@@ -37,12 +38,36 @@ WEEKLY_HABITS = [
     ("mom_call", "Звонок маме"),
     ("flowers", "Цветы Кате"),
 ]
-TRACKER_HEADERS = [
-    "Дата", "Шаги", "Сон до 00:00", "Благодарности",
-    "Калории", "Белок (г)", "Чтение 10мин",
-    "Без новостей", "Без соцсетей", "Без мучного", "Без сахара",
-    "Спорт", "Вес (кг)", "Планёрка", "Звонок маме", "Цветы Кате",
-]
+MONTH_NAMES_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+MONTH_NAMES_EN = {
+    1: "January", 2: "February", 3: "March", 4: "April",
+    5: "May", 6: "June", 7: "July", 8: "August",
+    9: "September", 10: "October", 11: "November", 12: "December",
+}
+
+# Строки в таблице (1-indexed)
+HABIT_ROWS = {
+    "steps":    5,
+    "gratitude": 6,
+    "sleep":    7,
+    "calories": 8,
+    "reading":  9,
+    "finance":  10,
+    "no_news":  11,
+    "no_social": 12,
+    "no_flour": 13,
+    "no_sugar": 14,
+    "planning": 16,
+    "mom_call": 17,
+    "flowers":  18,
+    "weight":   21,
+    "sport":    22,
+    "protein":  23,
+}
 
 checkin_state = {}  # {user_id: {habit_key: True/False, 'weight': float}}
 food_log = {}       # {user_id: {'date': str, 'calories': int, 'protein': int}}
@@ -150,6 +175,20 @@ def save_to_sheets(tasks_data, date_str):
             date_str, task.get("type", "работа"), task["task"],
             task["responsible"], task["deadline"], task["priority"], "Новая"
         ])
+
+
+def classify_text_intent(text):
+    response = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=10,
+        messages=[{"role": "user", "content": f"""Определи тип сообщения. Ответь ТОЛЬКО одним словом:
+- "tasks" — список задач, планы, что нужно сделать, рабочие заметки, итоги встречи
+- "calendar" — есть конкретная дата и время события
+- "chat" — обычный разговор, вопрос, сообщение
+
+Сообщение: {text}"""}]
+    )
+    return response.content[0].text.strip().lower()
 
 
 def classify_and_parse(transcript):
@@ -377,20 +416,30 @@ def get_garmin_steps(date_str):
         return ""
 
 
-def get_or_create_tracker_sheet():
-    global TRACKER_SPREADSHEET_ID
-    creds = get_google_creds([
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ])
+def get_tracker_sheet():
+    today = datetime.now()
+    month, year = today.month, today.year
+    creds = get_google_creds(["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
-    if TRACKER_SPREADSHEET_ID:
-        return gc.open_by_key(TRACKER_SPREADSHEET_ID).sheet1
-    sh = gc.create("Трекер привычек — Саша")
-    sh.share("ikhiritov@gmail.com", perm_type="user", role="writer")
-    TRACKER_SPREADSHEET_ID = sh.id
-    sh.sheet1.append_row(TRACKER_HEADERS)
-    return sh.sheet1
+    sh = gc.open_by_key(TRACKER_SPREADSHEET_ID)
+    for name in [
+        f"{MONTH_NAMES_RU[month]} {year}",
+        f"{MONTH_NAMES_EN[month]} {year}",
+        f"{MONTH_NAMES_RU[month].lower()} {year}",
+    ]:
+        try:
+            return sh.worksheet(name)
+        except Exception:
+            continue
+    raise Exception(
+        f"Не найден лист «{MONTH_NAMES_RU[month]} {year}» или «{MONTH_NAMES_EN[month]} {year}». "
+        f"Создай такую вкладку в таблице."
+    )
+
+
+def today_col():
+    # Column A=1 — названия, B=2 — "В дни", C=3 — день 1, D=4 — день 2 ...
+    return datetime.now().day + 2
 
 
 def bool_emoji(val):
@@ -428,14 +477,20 @@ def food_summary(user_id):
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ Создаю таблицу трекера...")
-    try:
-        sheet = get_or_create_tracker_sheet()
-        url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
+    if not TRACKER_SPREADSHEET_ID:
         await update.message.reply_text(
-            f"✅ Таблица готова!\n\n"
-            f"[Открыть таблицу]({url})\n\n"
-            f"Добавь в Railway переменную:\n`TRACKER_SPREADSHEET_ID={TRACKER_SPREADSHEET_ID}`",
+            "⚙️ Добавь в Railway переменную:\n`TRACKER_SPREADSHEET_ID=1IuG70Hb3tqOAsPQHt57Zzk4rar4nmNF6`",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        sheet = get_tracker_sheet()
+        url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
+        today = datetime.now()
+        month = today.month
+        year = today.year
+        await update.message.reply_text(
+            f"✅ Подключено! Лист «{sheet.title}»\n\n[Открыть таблицу]({url})",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -502,53 +557,65 @@ async def save_checkin_to_sheet(user_id, query, context):
     today_iso = today.strftime("%Y-%m-%d")
     is_sunday = today.weekday() == 6
     state = checkin_state.get(user_id, {})
+    col = today_col()
 
-    steps = get_garmin_steps(today_iso)
-
-    garmin = get_garmin_sleep(yesterday_iso)
-    sleep_ok = ""
-    if "error" not in garmin and garmin.get("bed_time"):
-        h = int(garmin["bed_time"].split(":")[0])
-        sleep_ok = "✅" if h < 24 else "❌"
-
-    log = food_log.get(user_id, {})
-    calories = log.get("calories", "") if log.get("date") == today_str else ""
-    protein = log.get("protein", "") if log.get("date") == today_str else ""
-
-    row = [
-        today_str, steps, sleep_ok,
-        bool_emoji(state.get("gratitude")),
-        calories, protein,
-        bool_emoji(state.get("reading")),
-        bool_emoji(state.get("no_news")),
-        bool_emoji(state.get("no_social")),
-        bool_emoji(state.get("no_flour")),
-        bool_emoji(state.get("no_sugar")),
-        bool_emoji(state.get("sport")),
-        state.get("weight", ""),
-        bool_emoji(state.get("planning")) if is_sunday else "",
-        bool_emoji(state.get("mom_call")) if is_sunday else "",
-        bool_emoji(state.get("flowers")) if is_sunday else "",
-    ]
+    def tick(val):
+        if val is True: return "✓"
+        if val is False: return ""
+        return ""
 
     try:
-        sheet = get_or_create_tracker_sheet()
-        sheet.append_row(row)
+        sheet = get_tracker_sheet()
+
+        def w(row, value):
+            if value not in (None, ""):
+                sheet.update_cell(row, col, value)
+
+        # Garmin шаги
+        steps = get_garmin_steps(today_iso)
+        w(HABIT_ROWS["steps"], steps)
+
+        # Garmin сон до 00:00
+        garmin = get_garmin_sleep(yesterday_iso)
+        if "error" not in garmin and garmin.get("bed_time"):
+            h = int(garmin["bed_time"].split(":")[0])
+            w(HABIT_ROWS["sleep"], "✓" if h < 24 else "")
+
+        # Калории из фото
+        log = food_log.get(user_id, {})
+        if log.get("date") == today_str and log.get("calories"):
+            w(HABIT_ROWS["calories"], log["calories"])
+
+        # Привычки
+        w(HABIT_ROWS["gratitude"], tick(state.get("gratitude")))
+        w(HABIT_ROWS["reading"],   tick(state.get("reading")))
+        w(HABIT_ROWS["finance"],   tick(state.get("finance")))
+        w(HABIT_ROWS["no_news"],   tick(state.get("no_news")))
+        w(HABIT_ROWS["no_social"], tick(state.get("no_social")))
+        w(HABIT_ROWS["no_flour"],  tick(state.get("no_flour")))
+        w(HABIT_ROWS["no_sugar"],  tick(state.get("no_sugar")))
+        w(HABIT_ROWS["sport"],     tick(state.get("sport")))
+
+        # Вес
+        if state.get("weight"):
+            w(HABIT_ROWS["weight"], state["weight"])
+
+        # Еженедельные (только воскресенье)
+        if is_sunday:
+            w(HABIT_ROWS["planning"], tick(state.get("planning")))
+            w(HABIT_ROWS["mom_call"], tick(state.get("mom_call")))
+            w(HABIT_ROWS["flowers"],  tick(state.get("flowers")))
+
         url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
-        summary = (
-            f"✅ *Чек-ин сохранён!*\n\n"
-            f"📊 Шаги: {steps or '—'} | Сон: {sleep_ok or '—'}\n"
-            f"🍽 {calories or 0} ккал | {protein or 0}г белка\n\n"
-            f"[Открыть таблицу]({url})"
+        await query.edit_message_text(
+            f"✅ *Чек-ин сохранён — {today_str}!*\n\n"
+            f"📊 Шаги: {steps or '—'}\n"
+            f"🍽 {log.get('calories', 0) if log.get('date') == today_str else 0} ккал\n\n"
+            f"[Открыть таблицу]({url})",
+            parse_mode="Markdown"
         )
-        await query.edit_message_text(summary, parse_mode="Markdown")
-        if TRACKER_SPREADSHEET_ID and "TRACKER_SPREADSHEET_ID" not in os.environ:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⚙️ Добавь в Railway env var:\n`TRACKER_SPREADSHEET_ID={TRACKER_SPREADSHEET_ID}`",
-                parse_mode="Markdown"
-            )
         checkin_state[user_id] = {}
+
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка сохранения: {e}")
 
@@ -663,6 +730,40 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
 
 BLOCKED_USERS = {7783251668}
 
+
+async def _save_tasks_and_calendar(text, message, date_str=None):
+    """Общая логика: всегда сохраняет задачи в Sheets, и создаёт событие в Calendar если есть дата+время."""
+    if date_str is None:
+        date_str = datetime.now().strftime("%d.%m.%Y")
+    tasks_data = extract_tasks(text)
+    save_to_sheets(tasks_data, date_str)
+
+    reply = f"✅ *Резюме:*\n{tasks_data['summary']}\n\n📋 *Задачи ({len(tasks_data['tasks'])} шт.):*\n"
+    for i, t in enumerate(tasks_data["tasks"], 1):
+        icon = "🏢" if t.get("type") == "работа" else "👤"
+        reply += f"\n{i}. {icon} {t['task']}\n   👤 {t['responsible']} | 📅 {t['deadline']} | ⚡ {t['priority']}\n"
+    reply += "\n📊 Всё записано в Google Sheets!"
+    await message.reply_text(reply, parse_mode="Markdown")
+
+    parsed = classify_and_parse(text)
+    if parsed["type"] == "calendar" and parsed.get("date") and parsed.get("time"):
+        link = create_calendar_event(
+            title=parsed["title"],
+            date_str=parsed["date"],
+            time_str=parsed["time"],
+            duration_minutes=parsed.get("duration_minutes", 60),
+            description=parsed.get("description") or ""
+        )
+        cal_reply = (
+            f"📅 *+ Событие в календарь:*\n\n"
+            f"*{parsed['title']}*\n"
+            f"📆 {parsed['date']} в {parsed['time']}\n"
+            f"⏱ {parsed.get('duration_minutes', 60)} мин\n\n"
+            f"[Открыть в Google Calendar]({link})"
+        )
+        await message.reply_text(cal_reply, parse_mode="Markdown")
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id in BLOCKED_USERS:
         return
@@ -680,30 +781,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📝 {transcript[:300]}{'...' if len(transcript) > 300 else ''}")
 
         await update.message.reply_text("🤖 Анализирую...")
-        parsed = classify_and_parse(transcript)
-
-        if parsed["type"] == "calendar" and parsed["date"] and parsed["time"]:
-            link = create_calendar_event(
-                title=parsed["title"],
-                date_str=parsed["date"],
-                time_str=parsed["time"],
-                duration_minutes=parsed.get("duration_minutes", 60),
-                description=parsed.get("description") or ""
-            )
-            reply = f"📅 *Событие создано в календаре:*\n\n*{parsed['title']}*\n📆 {parsed['date']} в {parsed['time']}\n⏱ {parsed.get('duration_minutes', 60)} мин\n\n[Открыть в Google Calendar]({link})"
-            await update.message.reply_text(reply, parse_mode="Markdown")
-        else:
-            date_str = datetime.now().strftime("%d.%m.%Y")
-            tasks_data = extract_tasks(transcript)
-            save_to_sheets(tasks_data, date_str)
-
-            reply = f"✅ *Резюме:*\n{tasks_data['summary']}\n\n📋 *Задачи ({len(tasks_data['tasks'])} шт.):*\n"
-            for i, t in enumerate(tasks_data["tasks"], 1):
-                icon = "🏢" if t.get("type") == "работа" else "👤"
-            reply += f"\n{i}. {icon} {t['task']}\n   👤 {t['responsible']} | 📅 {t['deadline']} | ⚡ {t['priority']}\n"
-        reply += "\n📊 Всё записано в Google Sheets!"
-
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        fwd = update.message.forward_date
+        date_str = (fwd + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd else None
+        await _save_tasks_and_calendar(transcript, update.message, date_str=date_str)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
     finally:
@@ -727,14 +807,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    intent = classify_text_intent(text)
+
+    if intent in ("tasks", "calendar"):
+        await update.message.reply_text("🤖 Анализирую как задачи...")
+        fwd = update.message.forward_date
+        date_str = (fwd + timedelta(hours=7)).strftime("%d.%m.%Y") if fwd else None
+        await _save_tasks_and_calendar(text, update.message, date_str=date_str)
+        return
+
     if user_id not in chat_histories:
         chat_histories[user_id] = []
 
     chat_histories[user_id].append({"role": "user", "content": text})
     if len(chat_histories[user_id]) > 20:
         chat_histories[user_id] = chat_histories[user_id][-20:]
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
