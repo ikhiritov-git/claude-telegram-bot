@@ -3,10 +3,12 @@ import json
 import base64
 import tempfile
 import anthropic
+import requests
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 from datetime import datetime, timedelta, time as dtime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -18,6 +20,8 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 GARMIN_EMAIL = os.environ.get("GARMIN_EMAIL", "")
 GARMIN_PASSWORD = os.environ.get("GARMIN_PASSWORD", "")
 TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 TRACKER_SPREADSHEET_ID = os.environ.get("TRACKER_SPREADSHEET_ID", "")
 SPREADSHEET_ID = "1OiwzcHadBvDJdn4qgf0wwueaHo7p5u_KXNfEvnbMTu0"
 CALENDAR_ID = "ikhiritov@gmail.com"
@@ -175,6 +179,123 @@ def save_to_sheets(tasks_data, date_str):
             date_str, task.get("type", "работа"), task["task"],
             task["responsible"], task["deadline"], task["priority"], "Новая"
         ])
+
+
+def extract_knowledge(transcript):
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": f"""Проанализируй расшифровку встречи/записи и извлеки структурированные знания. Верни ТОЛЬКО JSON:
+{{
+  "title": "краткое название темы (5-7 слов)",
+  "decisions": ["принятое решение 1", "принятое решение 2"],
+  "processes": ["описание процесса/порядка действий"],
+  "regulations": ["правило или стандарт который установили"],
+  "context": "важный контекст: факты о людях, ситуации, школе (2-3 предложения или пусто)"
+}}
+
+Если какой-то раздел пустой — верни пустой список [].
+Decisions — только конкретные принятые решения ("решили что...", "договорились...").
+Processes — порядок действий, как что-то делать.
+Regulations — правила, стандарты, требования ("всегда", "нельзя", "обязательно").
+
+Расшифровка:
+{transcript}"""}]
+    )
+    text = response.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
+def get_or_create_drive_folder(service, name, parent_id=None):
+    query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        body["parents"] = [parent_id]
+    folder = service.files().create(body=body, fields="id").execute()
+    return folder["id"]
+
+
+def save_transcript_to_drive(transcript, title, date_str):
+    creds = get_google_creds([
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive",
+    ])
+    service = build("drive", "v3", credentials=creds)
+    educamp_id = get_or_create_drive_folder(service, "EduCamp")
+    meetings_id = get_or_create_drive_folder(service, "Встречи", parent_id=educamp_id)
+
+    filename = f"{date_str} {title}.txt"
+    content = f"Дата: {date_str}\nТема: {title}\n\n{'='*50}\n\n{transcript}"
+    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+    file_meta = {"name": filename, "parents": [meetings_id]}
+    created = service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
+    return created.get("webViewLink", "")
+
+
+def save_to_notion(knowledge, transcript, date_str):
+    if not NOTION_TOKEN or not NOTION_DATABASE_ID:
+        return None
+
+    def rich(text):
+        return [{"type": "text", "text": {"content": text[:2000]}}]
+
+    def bullets(items):
+        return [{"object": "block", "type": "bulleted_list_item",
+                 "bulleted_list_item": {"rich_text": rich(item)}} for item in items if item]
+
+    children = []
+    if knowledge.get("decisions"):
+        children.append({"object": "block", "type": "heading_2",
+                          "heading_2": {"rich_text": rich("Решения")}})
+        children.extend(bullets(knowledge["decisions"]))
+
+    if knowledge.get("processes"):
+        children.append({"object": "block", "type": "heading_2",
+                          "heading_2": {"rich_text": rich("Процессы")}})
+        children.extend(bullets(knowledge["processes"]))
+
+    if knowledge.get("regulations"):
+        children.append({"object": "block", "type": "heading_2",
+                          "heading_2": {"rich_text": rich("Регламенты")}})
+        children.extend(bullets(knowledge["regulations"]))
+
+    if knowledge.get("context"):
+        children.append({"object": "block", "type": "heading_2",
+                          "heading_2": {"rich_text": rich("Контекст")}})
+        children.append({"object": "block", "type": "paragraph",
+                          "paragraph": {"rich_text": rich(knowledge["context"])}})
+
+    children.append({"object": "block", "type": "heading_2",
+                      "heading_2": {"rich_text": rich("Полная расшифровка")}})
+    children.append({"object": "block", "type": "paragraph",
+                      "paragraph": {"rich_text": rich(transcript[:2000])}})
+
+    payload = {
+        "parent": {"database_id": NOTION_DATABASE_ID},
+        "properties": {
+            "Name": {"title": rich(f"{date_str} — {knowledge.get('title', 'Без названия')}")},
+        },
+        "children": children,
+    }
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    r = requests.post("https://api.notion.com/v1/pages", json=payload, headers=headers)
+    if r.ok:
+        return r.json().get("url", "")
+    return None
 
 
 def classify_text_intent(text):
@@ -367,7 +488,15 @@ def build_report_prompt(yesterday_display, today_display, sleep, tasks, events):
     else:
         lines.append(f"Событий в календаре на сегодня ({today_display}) нет.\n")
 
-    lines.append("Напиши утренний брифинг: как спал (честно), что важного в задачах вчера, что предстоит сегодня по календарю. Если что-то требует внимания — скажи прямо. Без воды.")
+    lines.append("""Напиши утренний брифинг. Правила:
+
+СОН: оцени честно и по-человечески — хорошо/нормально/мало. SpO₂ и HRV упоминай нейтрально или поддерживающе, без тревоги и предупреждений о здоровье. Давление по Garmin не упоминай вообще — эти данные ненадёжны.
+
+ЗАДАЧИ: не перечисляй всё подряд. Выдели 2-3 самых важных на сегодня — те что срочные, высокий приоритет или долго висят. Остальное одной строкой "ещё N задач".
+
+КАЛЕНДАРЬ: коротко что предстоит.
+
+Тон: спокойный, поддерживающий, конкретный. Без воды, без алармизма, без медицинских советов.""")
     return "\n".join(lines)
 
 
@@ -401,6 +530,14 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         report_text = response.content[0].text
+
+        user_id = update.effective_user.id
+        if user_id not in chat_histories:
+            chat_histories[user_id] = []
+        chat_histories[user_id].append({"role": "assistant", "content": f"[Утренний брифинг {today_display}]\n{report_text}"})
+        if len(chat_histories[user_id]) > 40:
+            chat_histories[user_id] = chat_histories[user_id][-40:]
+
         await update.message.reply_text(f"🌅 *Утренний брифинг {today_display}*\n\n{report_text}", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -690,6 +827,12 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой chat ID: `{update.effective_chat.id}`", parse_mode="Markdown")
 
 
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_histories[user_id] = []
+    await update.message.reply_text("🗑 История чата очищена.")
+
+
 async def cmd_testbrief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧪 Тест автобрифинга...")
     await send_morning_brief(context)
@@ -719,6 +862,13 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
         )
 
         report_text = response.content[0].text
+
+        if TELEGRAM_CHAT_ID not in chat_histories:
+            chat_histories[TELEGRAM_CHAT_ID] = []
+        chat_histories[TELEGRAM_CHAT_ID].append({"role": "assistant", "content": f"[Утренний брифинг {today_display}]\n{report_text}"})
+        if len(chat_histories[TELEGRAM_CHAT_ID]) > 40:
+            chat_histories[TELEGRAM_CHAT_ID] = chat_histories[TELEGRAM_CHAT_ID][-40:]
+
         await context.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=f"🌅 *Утренний брифинг {today_display}*\n\n{report_text}",
@@ -732,9 +882,10 @@ BLOCKED_USERS = {7783251668}
 
 
 async def _save_tasks_and_calendar(text, message, date_str=None):
-    """Общая логика: всегда сохраняет задачи в Sheets, и создаёт событие в Calendar если есть дата+время."""
     if date_str is None:
         date_str = datetime.now().strftime("%d.%m.%Y")
+
+    # 1. Задачи → Google Sheets
     tasks_data = extract_tasks(text)
     save_to_sheets(tasks_data, date_str)
 
@@ -742,9 +893,10 @@ async def _save_tasks_and_calendar(text, message, date_str=None):
     for i, t in enumerate(tasks_data["tasks"], 1):
         icon = "🏢" if t.get("type") == "работа" else "👤"
         reply += f"\n{i}. {icon} {t['task']}\n   👤 {t['responsible']} | 📅 {t['deadline']} | ⚡ {t['priority']}\n"
-    reply += "\n📊 Всё записано в Google Sheets!"
+    reply += "\n📊 Сохранено в Google Sheets"
     await message.reply_text(reply, parse_mode="Markdown")
 
+    # 2. Календарь если есть дата+время
     parsed = classify_and_parse(text)
     if parsed["type"] == "calendar" and parsed.get("date") and parsed.get("time"):
         link = create_calendar_event(
@@ -762,6 +914,33 @@ async def _save_tasks_and_calendar(text, message, date_str=None):
             f"[Открыть в Google Calendar]({link})"
         )
         await message.reply_text(cal_reply, parse_mode="Markdown")
+
+    # 3. Знания → Google Drive + Notion
+    try:
+        knowledge = extract_knowledge(text)
+        title = knowledge.get("title", "Без названия")
+
+        drive_link = save_transcript_to_drive(text, title, date_str)
+        drive_msg = f"[📁 Открыть в Drive]({drive_link})" if drive_link else "📁 Drive: ошибка загрузки"
+
+        notion_url = save_to_notion(knowledge, text, date_str)
+        notion_msg = f"[🧠 Открыть в Notion]({notion_url})" if notion_url else "🧠 Notion: не настроен (добавь NOTION_TOKEN)"
+
+        has_content = any([knowledge.get("decisions"), knowledge.get("processes"), knowledge.get("regulations")])
+        if has_content:
+            kb_reply = f"*📚 База знаний обновлена*\n\n"
+            if knowledge.get("decisions"):
+                kb_reply += "*Решения:*\n" + "\n".join(f"• {d}" for d in knowledge["decisions"]) + "\n\n"
+            if knowledge.get("regulations"):
+                kb_reply += "*Регламенты:*\n" + "\n".join(f"• {r}" for r in knowledge["regulations"]) + "\n\n"
+            if knowledge.get("processes"):
+                kb_reply += "*Процессы:*\n" + "\n".join(f"• {p}" for p in knowledge["processes"]) + "\n\n"
+            kb_reply += f"{drive_msg}  |  {notion_msg}"
+            await message.reply_text(kb_reply, parse_mode="Markdown")
+        else:
+            await message.reply_text(f"📁 Транскрипт сохранён\n{drive_msg}  |  {notion_msg}", parse_mode="Markdown")
+    except Exception as e:
+        await message.reply_text(f"⚠️ База знаний: {e}")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,8 +1000,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_histories[user_id] = []
 
     chat_histories[user_id].append({"role": "user", "content": text})
-    if len(chat_histories[user_id]) > 20:
-        chat_histories[user_id] = chat_histories[user_id][-20:]
+    if len(chat_histories[user_id]) > 40:
+        chat_histories[user_id] = chat_histories[user_id][-40:]
 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -843,6 +1022,7 @@ def main():
     app.add_handler(CommandHandler("testbrief", cmd_testbrief))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(handle_checkin_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
