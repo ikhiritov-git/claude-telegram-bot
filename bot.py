@@ -1,6 +1,5 @@
 import os
 import json
-import base64
 import tempfile
 import anthropic
 import requests
@@ -74,7 +73,6 @@ HABIT_ROWS = {
 }
 
 checkin_state = {}  # {user_id: {habit_key: True/False, 'weight': float}}
-food_log = {}       # {user_id: {'date': str, 'calories': int, 'protein': int}}
 
 SYSTEM_PROMPT = """Ты личный ассистент Александра Ихиритова (Саши). У тебя есть глубокий контекст о его жизни — анализ 140+ файлов его личного дневника за 2020–2026 годы. Используй этот контекст когда отвечаешь — не нужно каждый раз его упоминать, просто знай его.
 
@@ -445,8 +443,22 @@ def get_today_events():
         return []
 
 
-def build_report_prompt(yesterday_display, today_display, sleep, tasks, events):
+def build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events):
     lines = [f"Утренний брифинг. Вчера: {yesterday_display}, сегодня: {today_display}\n"]
+
+    # Блок восстановления
+    recovery_lines = []
+    if daily_stats and "error" not in daily_stats:
+        if daily_stats.get("body_battery") is not None:
+            recovery_lines.append(f"  Body Battery (заряд после сна): {daily_stats['body_battery']}/100")
+        if daily_stats.get("resting_hr"):
+            recovery_lines.append(f"  ЧСС покоя: {daily_stats['resting_hr']} уд/мин")
+        if daily_stats.get("stress_avg") is not None:
+            recovery_lines.append(f"  Стресс за день: {daily_stats['stress_avg']} ({daily_stats.get('stress_label', '')})")
+    if recovery_lines:
+        lines.append("Восстановление:")
+        lines.extend(recovery_lines)
+        lines.append("")
 
     if "error" in sleep:
         lines.append(f"Сон: данные недоступны ({sleep['error']})\n")
@@ -460,6 +472,8 @@ def build_report_prompt(yesterday_display, today_display, sleep, tasks, events):
             lines.append(f"  Оценка сна: {sleep['score']}/100")
         if sleep.get("spo2"):
             lines.append(f"  SpO₂: {sleep['spo2']}%")
+        if sleep.get("respiration"):
+            lines.append(f"  Дыхание: {sleep['respiration']} вд/мин")
         if sleep.get("hrv_last_night"):
             hrv_line = f"  HRV ночью: {sleep['hrv_last_night']}"
             if sleep.get("hrv_weekly_avg"):
@@ -490,13 +504,15 @@ def build_report_prompt(yesterday_display, today_display, sleep, tasks, events):
 
     lines.append("""Напиши утренний брифинг. Правила:
 
-СОН: оцени честно и по-человечески — хорошо/нормально/мало. SpO₂ и HRV упоминай нейтрально или поддерживающе, без тревоги и предупреждений о здоровье. Давление по Garmin не упоминай вообще — эти данные ненадёжны.
+ВОССТАНОВЛЕНИЕ: начни с одной строки — оцени общий заряд по Body Battery и ЧСС покоя. Тон поддерживающий. Например: "Восстановился хорошо — батарея 78, пульс покоя 57."
 
-ЗАДАЧИ: не перечисляй всё подряд. Выдели 2-3 самых важных на сегодня — те что срочные, высокий приоритет или долго висят. Остальное одной строкой "ещё N задач".
+СОН: оцени честно и по-человечески — хорошо/нормально/мало. SpO₂, дыхание и HRV упоминай нейтрально, без тревоги и медицинских предупреждений. Давление по Garmin не упоминай вообще.
+
+ЗАДАЧИ: не перечисляй всё подряд. Выдели 2-3 самых важных — срочные, высокий приоритет или давно висят. Остальное одной строкой "ещё N задач".
 
 КАЛЕНДАРЬ: коротко что предстоит.
 
-Тон: спокойный, поддерживающий, конкретный. Без воды, без алармизма, без медицинских советов.""")
+Тон: спокойный, поддерживающий, конкретный. Без воды, без алармизма.""")
     return "\n".join(lines)
 
 
@@ -511,16 +527,19 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("⌚ Загружаю данные Garmin...")
         sleep = get_garmin_sleep(yesterday_iso)
+        daily_stats = get_garmin_daily_stats(yesterday_iso)
         if "error" in sleep:
-            await update.message.reply_text(f"⚠️ Garmin: {sleep['error']}")
+            await update.message.reply_text(f"⚠️ Garmin сон: {sleep['error']}")
         else:
-            await update.message.reply_text(f"✅ Garmin OK — сон {sleep['total']}")
+            bb = daily_stats.get("body_battery")
+            hr = daily_stats.get("resting_hr")
+            await update.message.reply_text(f"✅ Garmin OK — сон {sleep['total']}, батарея {bb}/100, ЧСС покоя {hr}")
 
         tasks = get_yesterday_tasks()
         events = get_today_events()
 
         await update.message.reply_text("🤖 Генерирую брифинг...")
-        prompt = build_report_prompt(yesterday_display, today_display, sleep, tasks, events)
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events)
 
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -551,6 +570,48 @@ def get_garmin_steps(date_str):
         return stats.get("totalSteps", "")
     except Exception:
         return ""
+
+
+def get_garmin_daily_stats(date_str):
+    """Body Battery, ЧСС покоя, стресс за date_str (YYYY-MM-DD)."""
+    try:
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        client.login()
+        stats = client.get_stats(date_str)
+
+        resting_hr = stats.get("restingHeartRate")
+        stress_avg = stats.get("averageStressLevel")
+        stress_max = stats.get("maxStressLevel")
+
+        body_battery = None
+        try:
+            bb = client.get_body_battery(date_str, date_str)
+            if bb:
+                val = max((entry.get("endBodyBatteryValue") or 0) for entry in bb)
+                if val > 0:
+                    body_battery = val
+        except Exception:
+            pass
+
+        def stress_label(val):
+            if val is None:
+                return None
+            if val < 26:
+                return "низкий"
+            if val < 51:
+                return "средний"
+            if val < 76:
+                return "высокий"
+            return "очень высокий"
+
+        return {
+            "resting_hr": resting_hr,
+            "stress_avg": stress_avg,
+            "stress_label": stress_label(stress_avg),
+            "body_battery": body_battery,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def get_tracker_sheet():
@@ -605,14 +666,6 @@ def build_checkin_keyboard(user_id, include_weekly=False):
     return InlineKeyboardMarkup(keyboard)
 
 
-def food_summary(user_id):
-    today = datetime.now().strftime("%d.%m.%Y")
-    log = food_log.get(user_id, {})
-    if log.get("date") != today:
-        return "нет данных"
-    return f"{log.get('calories', 0)} ккал | {log.get('protein', 0)}г белка"
-
-
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not TRACKER_SPREADSHEET_ID:
         await update.message.reply_text(
@@ -640,13 +693,8 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checkin_state[user_id] = {}
     today = datetime.now().strftime("%d.%m.%Y")
     is_sunday = datetime.now().weekday() == 6
-    text = (
-        f"📋 *Чек-ин {today}*\n\n"
-        f"🍽 Питание: {food_summary(user_id)}\n"
-        f"_(кидай фото еды прямо в чат)_\n\n"
-        f"Отметь привычки:"
-    )
-    msg = await update.message.reply_text(
+    text = f"📋 *Чек-ин {today}*\n\nОтметь привычки:"
+    await update.message.reply_text(
         text, parse_mode="Markdown",
         reply_markup=build_checkin_keyboard(user_id, include_weekly=is_sunday)
     )
@@ -675,14 +723,9 @@ async def handle_checkin_callback(update, context):
 
     is_sunday = datetime.now().weekday() == 6
     today = datetime.now().strftime("%d.%m.%Y")
-    text = (
-        f"📋 *Чек-ин {today}*\n\n"
-        f"🍽 Питание: {food_summary(user_id)}\n"
-        f"_(кидай фото еды прямо в чат)_\n\n"
-        f"Отметь привычки:"
-    )
     await query.edit_message_text(
-        text, parse_mode="Markdown",
+        f"📋 *Чек-ин {today}*\n\nОтметь привычки:",
+        parse_mode="Markdown",
         reply_markup=build_checkin_keyboard(user_id, include_weekly=is_sunday)
     )
 
@@ -718,11 +761,6 @@ async def save_checkin_to_sheet(user_id, query, context):
             h = int(garmin["bed_time"].split(":")[0])
             w(HABIT_ROWS["sleep"], "✓" if h < 24 else "")
 
-        # Калории из фото
-        log = food_log.get(user_id, {})
-        if log.get("date") == today_str and log.get("calories"):
-            w(HABIT_ROWS["calories"], log["calories"])
-
         # Привычки
         w(HABIT_ROWS["gratitude"], tick(state.get("gratitude")))
         w(HABIT_ROWS["reading"],   tick(state.get("reading")))
@@ -746,8 +784,7 @@ async def save_checkin_to_sheet(user_id, query, context):
         url = f"https://docs.google.com/spreadsheets/d/{TRACKER_SPREADSHEET_ID}"
         await query.edit_message_text(
             f"✅ *Чек-ин сохранён — {today_str}!*\n\n"
-            f"📊 Шаги: {steps or '—'}\n"
-            f"🍽 {log.get('calories', 0) if log.get('date') == today_str else 0} ккал\n\n"
+            f"📊 Шаги: {steps or '—'}\n\n"
             f"[Открыть таблицу]({url})",
             parse_mode="Markdown"
         )
@@ -755,72 +792,6 @@ async def save_checkin_to_sheet(user_id, query, context):
 
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка сохранения: {e}")
-
-
-async def scheduled_checkin(context: ContextTypes.DEFAULT_TYPE):
-    if not TELEGRAM_CHAT_ID:
-        return
-    if TELEGRAM_CHAT_ID not in checkin_state:
-        checkin_state[TELEGRAM_CHAT_ID] = {}
-    today = datetime.now().strftime("%d.%m.%Y")
-    is_sunday = datetime.now().weekday() == 6
-    text = (
-        f"📋 *Чек-ин {today}*\n\n"
-        f"🍽 Питание: {food_summary(TELEGRAM_CHAT_ID)}\n"
-        f"_(кидай фото еды прямо в чат)_\n\n"
-        f"Отметь привычки:"
-    )
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-        reply_markup=build_checkin_keyboard(TELEGRAM_CHAT_ID, include_weekly=is_sunday)
-    )
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text("🍽 Анализирую еду...")
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
-    try:
-        with open(tmp_path, "rb") as f:
-            img_data = base64.standard_b64encode(f.read()).decode("utf-8")
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=256,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_data}},
-                {"type": "text", "text": "Это фото еды. Оцени калории и белок. Верни ТОЛЬКО JSON без лишнего текста: {\"calories\": 450, \"protein\": 25, \"description\": \"краткое название блюда\"}"}
-            ]}]
-        )
-        text = response.content[0].text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        data = json.loads(text.strip())
-        cal = data.get("calories", 0)
-        prot = data.get("protein", 0)
-        desc = data.get("description", "")
-        today = datetime.now().strftime("%d.%m.%Y")
-        if user_id not in food_log or food_log[user_id].get("date") != today:
-            food_log[user_id] = {"date": today, "calories": 0, "protein": 0}
-        food_log[user_id]["calories"] += cal
-        food_log[user_id]["protein"] += prot
-        total_cal = food_log[user_id]["calories"]
-        total_prot = food_log[user_id]["protein"]
-        await update.message.reply_text(
-            f"🍽 *{desc}*\n~{cal} ккал | ~{prot}г белка\n\n📊 За сегодня: {total_cal} ккал | {total_prot}г белка",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Не смог проанализировать: {e}")
-    finally:
-        os.unlink(tmp_path)
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -849,10 +820,11 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         sleep = get_garmin_sleep(yesterday_iso)
+        daily_stats = get_garmin_daily_stats(yesterday_iso)
         tasks = get_yesterday_tasks()
         events = get_today_events()
 
-        prompt = build_report_prompt(yesterday_display, today_display, sleep, tasks, events)
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events)
 
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -1024,14 +996,11 @@ def main():
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(handle_checkin_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Автобриф в 8:30 по Нячангу (UTC+7 = 01:30 UTC)
     app.job_queue.run_daily(send_morning_brief, time=dtime(hour=1, minute=30))
-    # Чек-ин в 22:00 по Нячангу (UTC+7 = 15:00 UTC)
-    app.job_queue.run_daily(scheduled_checkin, time=dtime(hour=15, minute=0))
 
     print("Бот запущен...")
     app.run_polling()
