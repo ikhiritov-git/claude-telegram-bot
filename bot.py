@@ -373,6 +373,63 @@ def fmt_duration(seconds):
     return f"{h}ч {m}мин" if h else f"{m}мин"
 
 
+def get_weather():
+    """Получает погоду на сегодня для Нячанга, Далата и Романовки через Open-Meteo (бесплатно, без ключа)."""
+    locations = [
+        {"name": "Нячанг",    "lat": 12.2388, "lon": 109.1967, "tz": "Asia/Bangkok"},
+        {"name": "Далат",     "lat": 11.9404, "lon": 108.4583, "tz": "Asia/Bangkok"},
+        {"name": "Романовка", "lat": 50.60,   "lon": 107.60,   "tz": "Asia/Irkutsk"},
+    ]
+
+    def wcode_emoji(code):
+        if code is None: return "❓"
+        if code == 0: return "☀️"
+        if code in (1, 2): return "🌤"
+        if code == 3: return "☁️"
+        if code in (45, 48): return "🌫"
+        if code in (51, 53, 55, 56, 57): return "🌦"
+        if code in (61, 63, 65, 66, 67): return "🌧"
+        if code in (71, 73, 75, 77): return "❄️"
+        if code in (80, 81, 82): return "🌧"
+        if code in (85, 86): return "🌨"
+        if code in (95, 96, 99): return "⛈"
+        return "🌡"
+
+    results = []
+    for loc in locations:
+        try:
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={loc['lat']}&longitude={loc['lon']}"
+                f"&daily=temperature_2m_max,temperature_2m_min"
+                f",precipitation_sum,precipitation_probability_max,weather_code"
+                f"&timezone={loc['tz']}&forecast_days=1"
+            )
+            resp = requests.get(url, timeout=10)
+            d = resp.json().get("daily", {})
+
+            tmax = d.get("temperature_2m_max", [None])[0]
+            tmin = d.get("temperature_2m_min", [None])[0]
+            precip = d.get("precipitation_sum", [None])[0]
+            prob   = d.get("precipitation_probability_max", [None])[0]
+            wcode  = d.get("weather_code", [None])[0]
+
+            emoji = wcode_emoji(wcode)
+            temp  = f"{tmin:.0f}°..{tmax:.0f}°" if tmin is not None and tmax is not None else "—"
+
+            rain = ""
+            if prob is not None and prob >= 20:
+                rain = f", дождь {int(prob)}%"
+                if precip and precip > 0:
+                    rain += f" ({precip:.1f}мм)"
+
+            results.append(f"{emoji} {loc['name']}: {temp}{rain}")
+        except Exception:
+            results.append(f"❓ {loc['name']}: нет данных")
+
+    return results
+
+
 def get_garmin_sleep(date_str):
     """date_str: YYYY-MM-DD. Returns dict with sleep stats or {'error': ...}."""
     try:
@@ -450,7 +507,7 @@ def get_today_events():
         return []
 
 
-def build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events):
+def build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events, weather=None):
     lines = [f"Утренний брифинг. Вчера: {yesterday_display}, сегодня: {today_display}\n"]
 
     # Блок восстановления
@@ -509,6 +566,12 @@ def build_report_prompt(yesterday_display, today_display, sleep, daily_stats, ta
     else:
         lines.append(f"Событий в календаре на сегодня ({today_display}) нет.\n")
 
+    if weather:
+        lines.append(f"Погода на сегодня ({today_display}):")
+        for w in weather:
+            lines.append(f"  {w}")
+        lines.append("")
+
     lines.append("""Напиши утренний брифинг. Правила:
 
 ВОССТАНОВЛЕНИЕ: начни с одной строки — оцени общий заряд по Body Battery и ЧСС покоя. Тон поддерживающий. Например: "Восстановился хорошо — батарея 78, пульс покоя 57."
@@ -518,6 +581,8 @@ def build_report_prompt(yesterday_display, today_display, sleep, daily_stats, ta
 ЗАДАЧИ: не перечисляй всё подряд. Выдели 2-3 самых важных — срочные, высокий приоритет или давно висят. Остальное одной строкой "ещё N задач".
 
 КАЛЕНДАРЬ: коротко что предстоит.
+
+ПОГОДА: одной строкой — кратко по трём городам. Если дождь — отметь. Например: "Нячанг ☀️ 27-33°, Далат 🌧 18-24° (дождь 80%), Романовка ❄️ -5-2°"
 
 Тон: спокойный, поддерживающий, конкретный. Без воды, без алармизма.""")
     return "\n".join(lines)
@@ -544,9 +609,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tasks = get_yesterday_tasks()
         events = get_today_events()
+        weather = get_weather()
 
         await update.message.reply_text("🤖 Генерирую брифинг...")
-        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events)
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events, weather)
 
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -830,8 +896,9 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
         daily_stats = get_garmin_daily_stats(yesterday_iso)
         tasks = get_yesterday_tasks()
         events = get_today_events()
+        weather = get_weather()
 
-        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events)
+        prompt = build_report_prompt(yesterday_display, today_display, sleep, daily_stats, tasks, events, weather)
 
         response = claude.messages.create(
             model="claude-sonnet-4-6",
