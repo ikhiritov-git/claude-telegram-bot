@@ -22,6 +22,7 @@ TELEGRAM_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 TRACKER_SPREADSHEET_ID = os.environ.get("TRACKER_SPREADSHEET_ID", "")
+DRIVE_MEETINGS_FOLDER_ID = os.environ.get("DRIVE_MEETINGS_FOLDER_ID", "")
 SPREADSHEET_ID = "1OiwzcHadBvDJdn4qgf0wwueaHo7p5u_KXNfEvnbMTu0"
 CALENDAR_ID = "ikhiritov@gmail.com"
 VIETNAM_TZ_OFFSET = "+07:00"
@@ -229,8 +230,14 @@ def save_transcript_to_drive(transcript, title, date_str):
         "https://www.googleapis.com/auth/drive",
     ])
     service = build("drive", "v3", credentials=creds)
-    educamp_id = get_or_create_drive_folder(service, "EduCamp")
-    meetings_id = get_or_create_drive_folder(service, "Встречи", parent_id=educamp_id)
+
+    # Используем папку из env (расшаренную на сервис-аккаунт),
+    # иначе пробуем создать структуру (может не работать без квоты)
+    if DRIVE_MEETINGS_FOLDER_ID:
+        meetings_id = DRIVE_MEETINGS_FOLDER_ID
+    else:
+        educamp_id = get_or_create_drive_folder(service, "EduCamp")
+        meetings_id = get_or_create_drive_folder(service, "Встречи", parent_id=educamp_id)
 
     filename = f"{date_str} {title}.txt"
     content = f"Дата: {date_str}\nТема: {title}\n\n{'='*50}\n\n{transcript}"
