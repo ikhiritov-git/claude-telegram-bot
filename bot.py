@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from garminconnect import Garmin
@@ -445,8 +445,10 @@ def get_garmin_sleep(date_str):
 
         start_ts = dto.get("sleepStartTimestampLocal")
         end_ts = dto.get("sleepEndTimestampLocal")
-        bed_time = datetime.fromtimestamp(start_ts / 1000).strftime("%H:%M") if start_ts else None
-        wake_time = datetime.fromtimestamp(end_ts / 1000).strftime("%H:%M") if end_ts else None
+        # Поля *TimestampLocal уже сдвинуты Garmin в местное время, поэтому читаем
+        # их как UTC — иначе часовой пояс машины применится вторым сдвигом.
+        bed_time = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc).strftime("%H:%M") if start_ts else None
+        wake_time = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc).strftime("%H:%M") if end_ts else None
 
         return {
             "total": fmt_duration(dto.get("sleepTimeSeconds")),
@@ -832,7 +834,9 @@ async def save_checkin_to_sheet(user_id, query, context):
         garmin = get_garmin_sleep(yesterday_iso)
         if "error" not in garmin and garmin.get("bed_time"):
             h = int(garmin["bed_time"].split(":")[0])
-            w(HABIT_ROWS["sleep"], "✓" if h < 24 else "")
+            # bed_time в формате %H (0..23): вечерние часы = лёг до полуночи,
+            # часы после полуночи (0..11) = лёг уже за полночь.
+            w(HABIT_ROWS["sleep"], "✓" if h >= 12 else "")
 
         # Привычки
         w(HABIT_ROWS["gratitude"], tick(state.get("gratitude")))
